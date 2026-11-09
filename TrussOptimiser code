@@ -1,0 +1,166 @@
+# Run in any python IDE you wish
+# Built and tested in JupyterLab but should work everywhere
+
+import io
+import numpy as np
+import pandas as pd
+
+# -------------------------------- SETTINGS --------------------------------------
+SIGMA_Y = 255.0         # Nmm^-2 
+HOLE_DT = 3.2           # mm 
+SAFETY = 0.99            # this is just a safety factor cuz ig you maybe only want it like 5% within spec
+APPLIED_LOAD = 1350.0   # N
+
+# -------------------------- ALSO SETTINGS BUT PLEASE DONT TOUCH THIS -------------------------
+USE_CLIPBOARD = False   
+HOLE_AS_AREA = False    
+                        
+
+# ------------------------------------- BAR LIBRARY -----------------------------
+# FEEL FREE TO ADD STUFF IF MORE BARS ARE AVAILABLE
+
+BARS = pd.DataFrame({
+    "b":    [9.5,   12.5,  15.9,  16.0,  19.5],    # leg size (b), mm
+    "t":    [1.6,   1.6,   1.6,   2.0,   2.0],     # thickness (t), mm
+    "area": [27.7,  37.6,  46.9,  58.7,  73.2],    # total area, mm^2
+    "mpl":  [0.076, 0.102, 0.127, 0.159, 0.199],   # mass per length, gmm&-1
+})
+
+# ------------------------- BUCKLING CHART DATA -------------------------
+# DO NOT TOUCH THIS UNLESS YOU WANT TO ADAPT TO A DIFFERENT MATERIAL
+# Points read by AI off that forsaken chart. Crosschecked, erred on the side of caution, mostly consistent
+CURVE_CSV = """mode,lb,sigma
+A,0,255
+A,3,255
+A,12,178
+A,14,135
+A,16,103
+A,17,88
+A,18,77
+A,20,64
+A,22,52
+A,24,45
+A,26,38
+A,29,31
+A,34,24
+A,39,17
+B,0,255
+B,4.5,255
+B,18,178
+B,20,148
+B,22,123
+B,24,104
+B,26,86
+B,28.6,72
+B,30,65
+B,33,55
+B,36,47
+B,39,38
+C,0,255
+C,5.9,255
+C,24.5,178
+C,26,160
+C,27,148
+C,28,136
+C,30,116
+C,33,97
+C,36,81
+C,39,70
+"""
+# I would read a nice CSV file if i had one. so for now it's stuck as inputs. ew.
+
+# ----------------------------- INPUTS YOU CAN TOUCH ----------------------------
+# Columns: No, Length (mm), Load (N), MAKE SURE DATA IN THESE 3 COLUMNS IN THIS ORDER
+# Copypaste data from Excel I guess
+RAW = """0	142.3	4521
+1	142.3	4521
+2	142.3	4521
+3	142.3	4521
+4	142.3	4521
+5	142.3	4521
+6	135.8	-4315
+7	135.8	-4315
+8	135.8	-4315
+9	135.8	-4315
+10	135.8	-4315
+11	135.8	-4315
+12	288.9	0
+13	212.5	0
+14	252.2	0
+15	170	0
+16	217.6	0
+17	127.5	0
+18	186.3	0
+19	85	0
+20	160.2	0
+21	42.5	0
+"""
+
+# --------------------------- DO NOT TOUCH THIS --------------------------------
+
+curves = pd.read_csv(io.StringIO(CURVE_CSV))
+CURVES = {m: (g.sort_values("lb")["lb"].values, g.sort_values("lb")["sigma"].values)
+          for m, g in curves.groupby("mode")}
+
+def read_members():
+    src = None if USE_CLIPBOARD else io.StringIO(RAW)
+    kw = dict(sep=r"[\s,]+", engine="python", header=None)
+    df = pd.read_clipboard(**kw) if USE_CLIPBOARD else pd.read_csv(src, **kw)
+    df = df.iloc[:, :3].apply(pd.to_numeric, errors="coerce").dropna() # i cant be bothered to remove headings when i copypaste sometimes
+    df.columns = ["No", "Length_mm", "Load_N"]
+    df["No"] = df["No"].astype(int)
+    return df.reset_index(drop=True)
+
+
+# ------------------------------ CALCULATIONS --------------------------
+def eff_area(b, t, dt=HOLE_DT):
+    hole = dt * t if HOLE_AS_AREA else dt
+    return 0.9 * (2 * b * t - hole - b * t / 2)
+
+
+def sigma_cr(mode, lb):
+    x, y = CURVES[mode]
+    return 0.0 if lb > x[-1] else float(np.interp(lb, x, y)) # it refuses to stop throwing errors if i dont put if-else
+
+
+def candidates(length, load):
+    out = []
+    for bar in BARS.itertuples():
+        size = f"{bar.b:g}x{bar.t:g}"
+        if load > 0:                                 
+            out.append((size, "single", SIGMA_Y * eff_area(bar.b, bar.t), bar.mpl * length))
+        elif load == 0:
+            out.append((size, "half", 0, bar.mpl * length/2))
+        else:                                           
+            lb = length / bar.b                         
+            out.append((size, "single", sigma_cr("A", lb) * bar.area, bar.mpl * length))
+            s_dbl = min(sigma_cr("B", lb), sigma_cr("C", lb))   
+            out.append((size, "double", s_dbl * 2 * bar.area, 2 * bar.mpl * length))
+    return out
+
+
+def design(members):
+    rows = []
+    for m in members.itertuples():
+        ok = [c for c in candidates(m.Length_mm, m.Load_N) if c[2] >= SAFETY * abs(m.Load_N)]
+        if ok:
+            size, cfg, cap, mass = min(ok, key=lambda c: c[3])
+            util = round(100 * abs(m.Load_N) / cap, 1) if cap > 0 else 0.0  
+            rows.append([m.No, m.Length_mm, m.Load_N, size, cfg, round(cap), util, round(mass, 1)])
+        else:
+            rows.append([m.No, m.Length_mm, m.Load_N, size, cfg, round(cap), util, round(mass, 1)])
+    return pd.DataFrame(rows, columns=["No", "Length (mm)", "Load (N)", "Size", "Config",
+                                       "Capacity (N)", "Util (%)", "Mass (g)"])
+
+
+if __name__ == "__main__":
+    result = design(read_members())
+    print(result.to_string(index=False))
+    print(f"\nTotal mass: {result['Mass (g)'].sum():.1f} g")
+    worst = result["Util (%)"].max()
+    print(f"Predicted failure load: {APPLIED_LOAD * 100 / worst:.0f} N")
+    try:
+        result.to_clipboard(index=False) 
+        print("Results copied to clipboard, go paste it in Excel or something")
+    except Exception:
+        pass
